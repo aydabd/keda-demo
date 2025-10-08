@@ -1,0 +1,20 @@
+# Global code owners - These users will be requested for review when anyone opens a pull request
+* @aydabd
+
+# Specific file patterns
+# GitHub Actions workflows
+/.github/ @aydabd
+
+# Kubernetes manifests
+/manifests/ @aydabd
+
+# Scripts and executables
+/keda-demo @aydabd
+/log-watcher @aydabd
+
+# Documentation
+README.md @aydabd
+*.md @aydabd
+
+# Configuration files
+.gitignore @aydabd
