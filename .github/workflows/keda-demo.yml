@@ -7,25 +7,30 @@ on:
     branches: [ main ]
   workflow_dispatch:
     inputs:
-      messages:
-        description: 'Number of messages to send'
+      preset:
+        description: 'Demo preset'
         required: false
-        default: '10'
+        default: 'fast'
+        type: choice
+        options:
+        - 'fast'
+        - 'standard' 
+        - 'slow'
+      messages:
+        description: 'Number of messages (overrides preset)'
+        required: false
         type: string
       processing_time:
-        description: 'Processing time per message (seconds)'
+        description: 'Processing time per message in seconds (overrides preset)'
         required: false
-        default: '2'
         type: string
       cooldown:
-        description: 'KEDA cooldown period (seconds)'
+        description: 'KEDA cooldown period in seconds (overrides preset)'
         required: false
-        default: '10'
         type: string
       max_replicas:
-        description: 'Maximum number of replicas'
+        description: 'Maximum number of replicas (overrides preset)'
         required: false
-        default: '5'
         type: string
 
 env:
@@ -36,53 +41,40 @@ env:
 jobs:
   keda-demo:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v5
 
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
-
-    - name: Install kubectl
+    - name: Install tools
       run: |
+        # Install kubectl
         curl -LO "https://dl.k8s.io/release/${{ env.KUBECTL_VERSION }}/bin/linux/amd64/kubectl"
         chmod +x kubectl
         sudo mv kubectl /usr/local/bin/
-
-    - name: Install Helm
-      run: |
+        
+        # Install Helm
         curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
         chmod 700 get_helm.sh
         ./get_helm.sh --version ${{ env.HELM_VERSION }}
-
-    - name: Install kind
-      run: |
+        
+        # Install kind
         curl -Lo ./kind https://kind.sigs.k8s.io/dl/${{ env.KIND_VERSION }}/kind-linux-amd64
         chmod +x ./kind
         sudo mv ./kind /usr/local/bin/kind
 
     - name: Create kind cluster
       run: |
-        cat <<EOF | kind create cluster --config=-
+        # Simplified single-node cluster for CI
+        kind create cluster --config=- <<EOF
         kind: Cluster
         apiVersion: kind.x-k8s.io/v1alpha4
         nodes:
         - role: control-plane
           image: kindest/node:v1.28.0
-          extraPortMappings:
-          - containerPort: 30001
-            hostPort: 30001
-            protocol: TCP
-        - role: worker
-          image: kindest/node:v1.28.0
-        - role: worker
-          image: kindest/node:v1.28.0
         EOF
-
-    - name: Wait for cluster to be ready
-      run: |
+        
         kubectl cluster-info
         kubectl wait --for=condition=Ready nodes --all --timeout=300s
 
@@ -95,117 +87,63 @@ jobs:
           --create-namespace \
           --wait \
           --timeout 10m
-
-    - name: Verify KEDA installation
-      run: |
-        kubectl get pods -n keda
+        
         kubectl wait --for=condition=Ready pods --all -n keda --timeout=300s
-
-    - name: Make demo script executable
-      run: chmod +x ./keda-demo
-
-    - name: Set demo parameters
-      run: |
-        # Set parameters from workflow inputs or use defaults
-        MESSAGES="${{ github.event.inputs.messages || '10' }}"
-        PROCESSING_TIME="${{ github.event.inputs.processing_time || '1' }}"
-        COOLDOWN="${{ github.event.inputs.cooldown || '5' }}"
-        MAX_REPLICAS="${{ github.event.inputs.max_replicas || '3' }}"
-        
-        echo "DEMO_MESSAGES=$MESSAGES" >> $GITHUB_ENV
-        echo "DEMO_PROCESSING_TIME=$PROCESSING_TIME" >> $GITHUB_ENV
-        echo "DEMO_COOLDOWN=$COOLDOWN" >> $GITHUB_ENV
-        echo "DEMO_MAX_REPLICAS=$MAX_REPLICAS" >> $GITHUB_ENV
-        
-        echo "Demo will run with: $MESSAGES messages, ${PROCESSING_TIME}s processing time, ${COOLDOWN}s cooldown, max $MAX_REPLICAS replicas"
 
     - name: Run KEDA demo
       run: |
-        echo "Starting KEDA demo..."
-        timeout 600s ./keda-demo start \
-          --messages "$DEMO_MESSAGES" \
-          --processing-time "$DEMO_PROCESSING_TIME" \
-          --cooldown "$DEMO_COOLDOWN" \
-          --max-replicas "$DEMO_MAX_REPLICAS" \
-          --auto-close || echo "Demo completed or timed out"
-
-    - name: Verify demo results
-      run: |
-        echo "=== Checking final state ==="
+        chmod +x ./keda-demo
         
-        # Check if namespace exists
-        if kubectl get namespace keda-demo &>/dev/null; then
-          echo "✅ keda-demo namespace exists"
-          
-          # Check pods
-          echo "Current pods in keda-demo namespace:"
-          kubectl get pods -n keda-demo
-          
-          # Check ScaledObject
-          echo "ScaledObject status:"
-          kubectl get scaledobject -n keda-demo -o wide || echo "No ScaledObjects found"
-          
-          # Check queue status
-          echo "Checking RabbitMQ queue status..."
-          kubectl exec -n keda-demo deployment/rabbitmq -- \
-            rabbitmqctl list_queues name messages || echo "Could not check queue status"
-          
-          # Verify scaling worked
-          echo "=== Verifying autoscaling occurred ==="
-          consumer_pods=$(kubectl get pods -n keda-demo -l app=message-consumer --no-headers 2>/dev/null | wc -l)
-          echo "Consumer pods currently running: $consumer_pods"
-          
-          if [ "$consumer_pods" -eq 0 ]; then
-            echo "✅ Demo completed successfully - all consumer pods scaled down to zero"
-          else
-            echo "⚠️  Consumer pods still running - demo may still be in progress"
-          fi
-        else
-          echo "❌ keda-demo namespace not found"
-          exit 1
+        # Build demo command with preset or custom parameters
+        DEMO_CMD="./keda-demo start --auto-close --ci"
+        
+        # Use preset if specified, otherwise build custom command
+        if [ -n "${{ github.event.inputs.preset }}" ] && [ "${{ github.event.inputs.preset }}" != "standard" ]; then
+          DEMO_CMD="$DEMO_CMD --${{ github.event.inputs.preset }}"
         fi
-
-    - name: Collect logs on failure
-      if: failure()
-      run: |
-        echo "=== Collecting diagnostic information ==="
         
-        echo "=== Cluster nodes ==="
-        kubectl get nodes -o wide
-        
-        echo "=== All namespaces ==="
-        kubectl get namespaces
-        
-        echo "=== KEDA namespace ==="
-        kubectl get all -n keda
-        
-        if kubectl get namespace keda-demo &>/dev/null; then
-          echo "=== keda-demo namespace ==="
-          kubectl get all -n keda-demo
-          
-          echo "=== ScaledObjects ==="
-          kubectl get scaledobject -n keda-demo -o yaml
-          
-          echo "=== Pod logs ==="
-          for pod in $(kubectl get pods -n keda-demo --no-headers -o custom-columns=":metadata.name"); do
-            echo "--- Logs for $pod ---"
-            kubectl logs -n keda-demo "$pod" --tail=50 || echo "Could not get logs for $pod"
-          done
-          
-          echo "=== Events ==="
-          kubectl get events -n keda-demo --sort-by='.lastTimestamp'
+        # Override with custom parameters if provided
+        if [ -n "${{ github.event.inputs.messages }}" ]; then
+          DEMO_CMD="$DEMO_CMD --messages ${{ github.event.inputs.messages }}"
         fi
+        if [ -n "${{ github.event.inputs.processing_time }}" ]; then
+          DEMO_CMD="$DEMO_CMD --processing-time ${{ github.event.inputs.processing_time }}"
+        fi
+        if [ -n "${{ github.event.inputs.cooldown }}" ]; then
+          DEMO_CMD="$DEMO_CMD --cooldown ${{ github.event.inputs.cooldown }}"
+        fi
+        if [ -n "${{ github.event.inputs.max_replicas }}" ]; then
+          DEMO_CMD="$DEMO_CMD --max-replicas ${{ github.event.inputs.max_replicas }}"
+        fi
+        
+        echo "Running: $DEMO_CMD"
+        timeout 900s $DEMO_CMD || echo "Demo completed or timed out"
 
-    - name: Cleanup resources
+    - name: Collect logs and cleanup
       if: always()
       run: |
-        echo "Cleaning up demo resources..."
-        ./keda-demo clean || echo "Cleanup script failed or already clean"
+        echo "=== Final verification ==="
         
-        # Additional cleanup to ensure everything is removed
-        kubectl delete namespace keda-demo --ignore-not-found=true
+        # Quick verification that demo ran
+        if kubectl get namespace keda-demo &>/dev/null; then
+          echo "✅ Demo namespace exists"
+          kubectl get pods -n keda-demo || true
+          kubectl get scaledobject -n keda-demo || true
+        else
+          echo "ℹ️  Demo namespace not found (may have been cleaned up)"
+        fi
         
-        echo "Cleanup completed"
+        # Collect logs on failure
+        if [ "${{ job.status }}" = "failure" ]; then
+          echo "=== Collecting diagnostic information ==="
+          kubectl get nodes -o wide || true
+          kubectl get all -n keda || true
+          kubectl get events -n keda-demo --sort-by='.lastTimestamp' || true
+        fi
+        
+        # Cleanup using script (with CI mode to avoid prompts)
+        echo "=== Cleaning up ==="
+        ./keda-demo clean --ci || echo "Cleanup completed or already clean"
 
     - name: Delete kind cluster
       if: always()

@@ -30,6 +30,8 @@ COOLDOWN_PERIOD=$DEFAULT_COOLDOWN_PERIOD
 MAX_REPLICAS=$DEFAULT_MAX_REPLICAS
 AUTO_WATCH=false
 AUTO_CLOSE=false
+CI_MODE=false
+SKIP_KEDA_INSTALL=false
 WATCH_PID=""
 
 # Signal handler for cleanup
@@ -143,6 +145,8 @@ Options:
   -r, --max-replicas N     Maximum number of replicas (default: $DEFAULT_MAX_REPLICAS)
   -w, --watch              Auto-start log watcher in background
   -a, --auto-close         Auto-close when demo completes (requires --watch)
+  --ci                     CI mode: skip prompts, optimized for automation
+  --skip-keda-install      Skip KEDA installation (assume already installed)
   -h, --help               Show this help
 
 Examples:
@@ -150,6 +154,7 @@ Examples:
   $0 start --messages 20 --watch     # 20 messages with auto-watch
   $0 start -m 10 -t 1 -c 5           # Fast demo (10 msgs, 1s processing, 5s cooldown)
   $0 start --fast --watch --auto-close  # Fully automated demo
+  $0 start --fast --ci --auto-close     # CI-optimized demo
 
 Presets:
   $0 start --fast        # Fast demo: -m 10 -t 1 -c 5 -i 1
@@ -193,6 +198,14 @@ parse_args() {
                 AUTO_CLOSE=true
                 shift
                 ;;
+            --ci)
+                CI_MODE=true
+                shift
+                ;;
+            --skip-keda-install)
+                SKIP_KEDA_INSTALL=true
+                shift
+                ;;
             --fast)
                 MESSAGES=10
                 PROCESSING_TIME=1
@@ -222,9 +235,27 @@ parse_args() {
     # Auto-close requires watch mode
     if [ "$AUTO_CLOSE" = true ]; then
         if [ "$AUTO_WATCH" = false ]; then
-            log_info "Auto-close enabled, automatically enabling watch mode"
+            if [ "$CI_MODE" = true ]; then
+                log_debug "CI mode: Auto-close enabled, automatically enabling watch mode"
+            else
+                log_info "Auto-close enabled, automatically enabling watch mode"
+            fi
             AUTO_WATCH=true
         fi
+    fi
+    
+    # CI mode optimizations
+    if [ "$CI_MODE" = true ]; then
+        # In CI mode, always use fast defaults if not already set by preset
+        if [ "$MESSAGES" -eq "$DEFAULT_MESSAGES" ] && [ "$PROCESSING_TIME" -eq "$DEFAULT_PROCESSING_TIME" ]; then
+            MESSAGES=10
+            PROCESSING_TIME=1
+            COOLDOWN_PERIOD=5
+            POLLING_INTERVAL=1
+            log_debug "CI mode: Using fast defaults"
+        fi
+        SKIP_KEDA_INSTALL=true  # Assume CI already installed KEDA
+        log_debug "CI mode: Skipping KEDA installation"
     fi
 }
 
@@ -249,6 +280,11 @@ check_prerequisites() {
 
 # Install KEDA
 install_keda() {
+    if [ "$SKIP_KEDA_INSTALL" = true ]; then
+        log_debug "Skipping KEDA installation (--skip-keda-install or --ci mode)"
+        return 0
+    fi
+    
     log_progress "📦 Installing KEDA..."
     
     helm repo add kedacore https://kedacore.github.io/charts &>/dev/null || true
@@ -389,11 +425,15 @@ show_summary() {
             fi
         fi
     else
-        echo ""
-        log_custom "$LOG_YELLOW" "💡" "To watch scaling in real-time, run:"
-        echo -e "   ${LOG_GREEN}$SCRIPT_DIR/log-watcher${LOG_NC}"
-        echo ""
-        read -r -p "Press ENTER to continue..."
+        if [ "$CI_MODE" = false ]; then
+            echo ""
+            log_custom "$LOG_YELLOW" "💡" "To watch scaling in real-time, run:"
+            echo -e "   ${LOG_GREEN}$SCRIPT_DIR/log-watcher${LOG_NC}"
+            echo ""
+            read -r -p "Press ENTER to continue..."
+        else
+            log_debug "CI mode: Skipping interactive prompt"
+        fi
     fi
 }
 
@@ -441,18 +481,23 @@ cleanup_demo() {
         echo -e " ${LOG_YELLOW}(not found)${LOG_NC}"
     fi
     
-    echo ""
-    read -p "$(echo -e "${LOG_YELLOW}Remove KEDA itself? (y/N): ${LOG_NC}")" -n 1 -r
-    echo ""
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        log_progress "🗑️  Removing KEDA..."
-        if helm list -n keda | grep -q keda; then
-            helm uninstall keda -n keda &>/dev/null
-            kubectl delete namespace keda &>/dev/null
-            log_progress_done
-        else
-            echo -e " ${LOG_YELLOW}(not installed)${LOG_NC}"
+    # In CI mode, don't remove KEDA (managed by CI)
+    if [ "$CI_MODE" = false ]; then
+        echo ""
+        read -p "$(echo -e "${LOG_YELLOW}Remove KEDA itself? (y/N): ${LOG_NC}")" -n 1 -r
+        echo ""
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            log_progress "🗑️  Removing KEDA..."
+            if helm list -n keda | grep -q keda; then
+                helm uninstall keda -n keda &>/dev/null
+                kubectl delete namespace keda &>/dev/null
+                log_progress_done
+            else
+                echo -e " ${LOG_YELLOW}(not installed)${LOG_NC}"
+            fi
         fi
+    else
+        log_debug "CI mode: Skipping KEDA removal (managed by CI)"
     fi
     
     echo ""
@@ -478,6 +523,20 @@ case "${1:-}" in
         start_demo
         ;;
     "clean")
+        shift
+        # Parse --ci flag for cleanup
+        while [[ $# -gt 0 ]]; do
+            case $1 in
+                --ci)
+                    CI_MODE=true
+                    shift
+                    ;;
+                *)
+                    log_error "Unknown cleanup option: $1"
+                    exit 1
+                    ;;
+            esac
+        done
         cleanup_demo
         ;;
     "watch")
