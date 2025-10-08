@@ -1,0 +1,19 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: rabbitmq-consumer-scaler
+  namespace: keda-demo
+spec:
+  scaleTargetRef:
+    name: message-consumer
+  pollingInterval: __POLLING_INTERVAL__
+  cooldownPeriod: __COOLDOWN_PERIOD__
+  minReplicaCount: 0
+  maxReplicaCount: __MAX_REPLICAS__
+  triggers:
+  - type: rabbitmq
+    metadata:
+      host: amqp://guest:guest@rabbitmq.keda-demo.svc.cluster.local:5672/
+      queueName: demo-queue
+      mode: QueueLength
+      value: "__MESSAGES_PER_POD__"

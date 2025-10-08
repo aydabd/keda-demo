@@ -1,0 +1,500 @@
+#!/bin/bash
+# KEDA Demo - Refactored with configurable timing and better UX
+# Usage: 
+#   ./keda-demo start [options]  - Run the demo
+#   ./keda-demo clean            - Clean up resources
+#   ./keda-demo watch            - Start log watcher
+
+set -e
+
+# Source the logger utility
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMMON_DIR="$SCRIPT_DIR/common"
+# shellcheck disable=SC1091
+. "$COMMON_DIR/logger.sh"
+
+# Default configuration
+DEFAULT_MESSAGES=15
+DEFAULT_MESSAGES_PER_POD=5
+DEFAULT_PROCESSING_TIME=2
+DEFAULT_POLLING_INTERVAL=2
+DEFAULT_COOLDOWN_PERIOD=10
+DEFAULT_MAX_REPLICAS=10
+
+# Current configuration (will be set by parse_args)
+MESSAGES=$DEFAULT_MESSAGES
+MESSAGES_PER_POD=$DEFAULT_MESSAGES_PER_POD
+PROCESSING_TIME=$DEFAULT_PROCESSING_TIME
+POLLING_INTERVAL=$DEFAULT_POLLING_INTERVAL
+COOLDOWN_PERIOD=$DEFAULT_COOLDOWN_PERIOD
+MAX_REPLICAS=$DEFAULT_MAX_REPLICAS
+AUTO_WATCH=false
+AUTO_CLOSE=false
+WATCH_PID=""
+
+# Signal handler for cleanup
+cleanup_on_exit() {
+    echo ""
+    log_warn "🛑 Received interrupt signal..."
+    if [ -n "$WATCH_PID" ] && kill -0 "$WATCH_PID" 2>/dev/null; then
+        log_cleanup "Stopping log watcher (PID: $WATCH_PID)..."
+        kill "$WATCH_PID" 2>/dev/null
+        wait "$WATCH_PID" 2>/dev/null || true
+    fi
+    log_success "Cleanup complete. Goodbye!"
+    exit 0
+}
+
+# Set up signal handlers
+trap cleanup_on_exit SIGINT SIGTERM
+
+# Progress bar function
+show_progress() {
+    local current=$1
+    local total=$2
+    local width=50
+    local percentage=$((current * 100 / total))
+    local completed=$((current * width / total))
+    local remaining=$((width - completed))
+    
+    printf "\r["
+    # Reworked to avoid variables in format string
+    printf "%*s" "$completed" "" | tr ' ' '='
+    printf "%*s" "$remaining" "" | tr ' ' '-'
+    printf "] %d%% (%d/%d)" "$percentage" "$current" "$total"
+}
+
+# Spinner for long operations
+spinner() {
+    local pid=$1
+    local delay=0.1
+    #shellcheck disable=SC1003
+    local spinstr='|/-\'$'\\'  # Proper way to include backslash
+    printf " "
+    # Replaced subshell + grep with kill -0 (ShellCheck SC2143 fix)
+    while kill -0 "$pid" 2>/dev/null; do
+        local temp=${spinstr#?}
+        # Avoid variable in format string
+        printf "\b%s" "${spinstr%"$temp"}"
+        local spinstr=$temp${spinstr%"$temp"}
+        sleep $delay
+    done
+    printf "\b "
+}
+
+# Monitor demo completion and auto-close
+monitor_demo_completion() {
+    local max_wait=${1:-300}  # Maximum wait time in seconds (5 minutes)
+    local check_interval=10   # Check every 10 seconds
+    local waited=0
+    
+    log_debug "Monitoring demo completion..."
+    
+    while [ "$waited" -lt "$max_wait" ]; do
+        # Check if queue is empty and no consumer pods are running
+        local queue_messages
+        local queue_output
+        queue_output=$(kubectl exec -n keda-demo deployment/rabbitmq -- \
+            rabbitmqctl list_queues name messages 2>/dev/null | grep demo-queue 2>/dev/null || true)
+        
+        if [ -n "$queue_output" ]; then
+            queue_messages=$(echo "$queue_output" | awk '{print $2}')
+        else
+            # Queue doesn't exist or is empty - treat as 0 messages
+            queue_messages="0"
+        fi
+        
+        local consumer_pods
+        consumer_pods=$(kubectl get pods -n keda-demo -l app=message-consumer --no-headers 2>/dev/null | wc -l | tr -d ' ' || echo "0")
+        
+        if [ "$queue_messages" = "0" ] && [ "$consumer_pods" = "0" ]; then
+            log_success "Demo completed! Queue empty and all consumer pods scaled down."
+            log_custom "$LOG_YELLOW" "🏁" "Auto-closing in 5 seconds..."
+            sleep 5
+            return 0
+        fi
+        
+        log_custom "$LOG_BLUE" "📊" "Queue: ${queue_messages} messages, Consumer pods: ${consumer_pods}"
+        sleep $check_interval
+        waited=$((waited + check_interval))
+    done
+    
+    log_warn "⏰ Maximum wait time reached. Demo may still be running."
+    return 1
+}
+
+# Show usage
+show_usage() {
+    cat <<EOF
+$(log_step "KEDA Demo for Rancher Desktop")
+==================================
+
+Usage:
+  $0 start [options]   - Run the KEDA demo
+  $0 clean             - Clean up all resources
+  $0 watch             - Start log watcher
+
+Options:
+  -m, --messages N         Number of messages to send (default: $DEFAULT_MESSAGES)
+  -p, --per-pod N          Messages per pod threshold (default: $DEFAULT_MESSAGES_PER_POD)
+  -t, --processing-time N  Processing time per message in seconds (default: $DEFAULT_PROCESSING_TIME)
+  -i, --polling N          KEDA polling interval in seconds (default: $DEFAULT_POLLING_INTERVAL)
+  -c, --cooldown N         KEDA cooldown period in seconds (default: $DEFAULT_COOLDOWN_PERIOD)
+  -r, --max-replicas N     Maximum number of replicas (default: $DEFAULT_MAX_REPLICAS)
+  -w, --watch              Auto-start log watcher in background
+  -a, --auto-close         Auto-close when demo completes (requires --watch)
+  -h, --help               Show this help
+
+Examples:
+  $0 start                           # Standard demo
+  $0 start --messages 20 --watch     # 20 messages with auto-watch
+  $0 start -m 10 -t 1 -c 5           # Fast demo (10 msgs, 1s processing, 5s cooldown)
+  $0 start --fast --watch --auto-close  # Fully automated demo
+
+Presets:
+  $0 start --fast        # Fast demo: -m 10 -t 1 -c 5 -i 1
+  $0 start --slow        # Slow demo: -m 20 -t 5 -c 30 -i 5
+EOF
+}
+
+# Parse command line arguments
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -m|--messages)
+                MESSAGES="$2"
+                shift 2
+                ;;
+            -p|--per-pod)
+                MESSAGES_PER_POD="$2"
+                shift 2
+                ;;
+            -t|--processing-time)
+                PROCESSING_TIME="$2"
+                shift 2
+                ;;
+            -i|--polling)
+                POLLING_INTERVAL="$2"
+                shift 2
+                ;;
+            -c|--cooldown)
+                COOLDOWN_PERIOD="$2"
+                shift 2
+                ;;
+            -r|--max-replicas)
+                MAX_REPLICAS="$2"
+                shift 2
+                ;;
+            -w|--watch)
+                AUTO_WATCH=true
+                shift
+                ;;
+            -a|--auto-close)
+                AUTO_CLOSE=true
+                shift
+                ;;
+            --fast)
+                MESSAGES=10
+                PROCESSING_TIME=1
+                COOLDOWN_PERIOD=5
+                POLLING_INTERVAL=1
+                shift
+                ;;
+            --slow)
+                MESSAGES=20
+                PROCESSING_TIME=5
+                COOLDOWN_PERIOD=30
+                POLLING_INTERVAL=5
+                shift
+                ;;
+            -h|--help)
+                show_usage
+                exit 0
+                ;;
+            *)
+                log_error "Unknown option: $1"
+                show_usage
+                exit 1
+                ;;
+        esac
+    done
+    
+    # Auto-close requires watch mode
+    if [ "$AUTO_CLOSE" = true ]; then
+        if [ "$AUTO_WATCH" = false ]; then
+            log_info "Auto-close enabled, automatically enabling watch mode"
+            AUTO_WATCH=true
+        fi
+    fi
+}
+
+# Check prerequisites
+check_prerequisites() {
+    log_progress "Checking prerequisites..."
+    
+    if ! kubectl version --client &> /dev/null; then
+        echo ""
+        log_error "kubectl not found. Make sure Rancher Desktop is running!"
+        exit 1
+    fi
+
+    if ! command -v helm &> /dev/null; then
+        echo ""
+        log_error "Helm not found. Please install Helm."
+        exit 1
+    fi
+    
+    log_progress_done
+}
+
+# Install KEDA
+install_keda() {
+    log_progress "📦 Installing KEDA..."
+    
+    helm repo add kedacore https://kedacore.github.io/charts &>/dev/null || true
+    helm repo update &>/dev/null
+    
+    (helm upgrade --install keda kedacore/keda \
+        --namespace keda \
+        --create-namespace \
+        --wait \
+        --timeout 5m &>/dev/null) &
+    
+    spinner $!
+    log_progress_done
+}
+
+# Create namespace
+create_namespace() {
+    log_progress "📦 Creating demo namespace..."
+    kubectl create namespace keda-demo --dry-run=client -o yaml | kubectl apply -f - &>/dev/null
+    log_progress_done
+}
+
+# Deploy component with progress
+deploy_component() {
+    local name=$1
+    local file=$2
+    
+    log_progress "🚀 Deploying $name..."
+    kubectl apply -f "$file" &>/dev/null
+    log_progress_done
+}
+
+# Wait for component readiness
+wait_for_ready() {
+    local component=$1
+    local timeout=${2:-120}
+    
+    log_progress "⏳ Waiting for $component to be ready..."
+    kubectl wait --for=condition=ready pod -l app="$component" -n keda-demo --timeout="${timeout}"s &>/dev/null
+    log_progress_done
+}
+
+# Configure and deploy manifests
+deploy_manifests() {
+    local script_dir
+    script_dir="${1:-$SCRIPT_DIR}"
+    local manifests_dir="$script_dir/manifests"
+    
+    # Deploy RabbitMQ
+    deploy_component "RabbitMQ" "$manifests_dir/rabbitmq.yaml"
+    wait_for_ready "rabbitmq"
+    
+    # Wait for RabbitMQ service
+    log_progress "⏳ Waiting for RabbitMQ service..."
+    for i in {1..30}; do
+        if kubectl exec -n keda-demo deployment/rabbitmq -- rabbitmqctl status &>/dev/null; then
+            break
+        fi
+        sleep 2
+        if [ "$i" -eq 30 ]; then
+            echo ""
+            log_error "RabbitMQ service failed to start"
+            exit 1
+        fi
+    done
+    log_progress_done
+    
+    # Create queue
+    log_progress "📦 Creating RabbitMQ queue..."
+    kubectl exec -n keda-demo deployment/rabbitmq -- \
+        rabbitmqadmin declare queue name=demo-queue durable=true &>/dev/null
+    log_progress_done
+    
+    # Configure and deploy consumer
+    log_progress "📝 Deploying consumer..."
+    sed "s/__PROCESSING_TIME__/$PROCESSING_TIME/g" "$manifests_dir/consumer.yaml" | \
+        kubectl apply -f - &>/dev/null
+    log_progress_done
+    
+    # Configure and deploy KEDA ScaledObject
+    log_progress "⚡ Creating KEDA ScaledObject..."
+    sed -e "s/__POLLING_INTERVAL__/$POLLING_INTERVAL/g" \
+        -e "s/__COOLDOWN_PERIOD__/$COOLDOWN_PERIOD/g" \
+        -e "s/__MAX_REPLICAS__/$MAX_REPLICAS/g" \
+        -e "s/__MESSAGES_PER_POD__/$MESSAGES_PER_POD/g" \
+        "$manifests_dir/scaledobject.yaml" | \
+        kubectl apply -f - &>/dev/null
+    log_progress_done
+}
+
+# Send messages with progress bar
+send_messages() {
+    echo ""
+    log_custom "$LOG_CYAN" "📨" "Sending $MESSAGES messages..."
+    
+    for i in $(seq 1 "$MESSAGES"); do
+        kubectl exec -n keda-demo deployment/rabbitmq -- \
+            rabbitmqadmin publish exchange=amq.default routing_key=demo-queue payload="Message $i" &>/dev/null
+        show_progress "$i" "$MESSAGES"
+        sleep 0.1  # Small delay to show progress
+    done
+    echo ""
+    log_success "All messages sent!"
+}
+
+# Show demo summary
+show_summary() {
+    local expected_pods=$((MESSAGES / MESSAGES_PER_POD))
+    if [ $((MESSAGES % MESSAGES_PER_POD)) -ne 0 ]; then
+        expected_pods=$((expected_pods + 1))
+    fi
+    
+    echo ""
+    log_custom "$LOG_BLUE" "📊" "Demo Configuration:"
+    echo -e "  Messages: ${LOG_YELLOW}$MESSAGES${LOG_NC}"
+    echo -e "  Messages per pod: ${LOG_YELLOW}$MESSAGES_PER_POD${LOG_NC}"
+    echo -e "  Expected pods: ${LOG_YELLOW}$expected_pods${LOG_NC}"
+    echo -e "  Processing time: ${LOG_YELLOW}${PROCESSING_TIME}s per message${LOG_NC}"
+    echo -e "  Cooldown period: ${LOG_YELLOW}${COOLDOWN_PERIOD}s${LOG_NC}"
+    echo -e "  Polling interval: ${LOG_YELLOW}${POLLING_INTERVAL}s${LOG_NC}"
+    echo ""
+    log_custom "$LOG_GREEN" "🎬" "Demo ready! KEDA will auto-scale from 0 → $expected_pods → 0"
+    
+    if [ "$AUTO_WATCH" = true ]; then
+        echo ""
+        log_debug "Starting log watcher..."
+        if [ ! -f "$SCRIPT_DIR/log-watcher" ]; then
+            log_error "log-watcher script not found"
+        else
+            chmod +x "$SCRIPT_DIR/log-watcher"
+            "$SCRIPT_DIR/log-watcher" &
+            WATCH_PID=$!
+            log_success "Log watcher started (PID: $WATCH_PID)"
+            if [ "$AUTO_CLOSE" = true ]; then
+                log_custom "$LOG_YELLOW" "🤖" "Auto-close enabled - will exit when demo completes"
+            else
+                log_info "Press Ctrl+C to stop the demo and watcher"
+            fi
+        fi
+    else
+        echo ""
+        log_custom "$LOG_YELLOW" "💡" "To watch scaling in real-time, run:"
+        echo -e "   ${LOG_GREEN}$SCRIPT_DIR/log-watcher${LOG_NC}"
+        echo ""
+        read -r -p "Press ENTER to continue..."
+    fi
+}
+
+# Main demo function
+start_demo() {
+    log_header "KEDA Demo Starting..."
+    
+    check_prerequisites
+    install_keda
+    create_namespace
+    deploy_manifests
+    show_summary
+    send_messages
+    
+    echo ""
+    log_custom "$LOG_GREEN" "🎉" "Demo complete! Check the log watcher to see scaling in action."
+    
+    # Keep running if auto-watch is enabled
+    if [ "$AUTO_WATCH" = true ] && [ -n "$WATCH_PID" ]; then
+        if [ "$AUTO_CLOSE" = true ]; then
+            log_custom "$LOG_YELLOW" "🤖" "Auto-close enabled. Monitoring for completion..."
+            if monitor_demo_completion; then
+                log_custom "$LOG_GREEN" "🎯" "Demo completed successfully! Auto-closing..."
+                cleanup_on_exit
+            else
+                log_warn "Auto-close timeout reached. Use Ctrl+C to exit manually."
+                wait "$WATCH_PID" 2>/dev/null || true
+            fi
+        else
+            log_warn "Watching demo... Press Ctrl+C to exit and cleanup."
+            wait "$WATCH_PID" 2>/dev/null || true
+        fi
+    fi
+}
+
+# Clean up resources
+cleanup_demo() {
+    log_header "🧹 Cleaning up KEDA Demo resources..."
+    
+    log_progress "🗑️  Removing demo namespace..."
+    if kubectl get namespace keda-demo &> /dev/null; then
+        kubectl delete namespace keda-demo &>/dev/null
+        log_progress_done
+    else
+        echo -e " ${LOG_YELLOW}(not found)${LOG_NC}"
+    fi
+    
+    echo ""
+    read -p "$(echo -e "${LOG_YELLOW}Remove KEDA itself? (y/N): ${LOG_NC}")" -n 1 -r
+    echo ""
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        log_progress "🗑️  Removing KEDA..."
+        if helm list -n keda | grep -q keda; then
+            helm uninstall keda -n keda &>/dev/null
+            kubectl delete namespace keda &>/dev/null
+            log_progress_done
+        else
+            echo -e " ${LOG_YELLOW}(not installed)${LOG_NC}"
+        fi
+    fi
+    
+    echo ""
+    log_custom "$LOG_GREEN" "🎉" "Cleanup complete!"
+}
+
+# Start log watcher
+start_watch() {
+    if [ ! -f "$SCRIPT_DIR/log-watcher" ]; then
+        log_error "log-watcher script not found"
+        exit 1
+    fi
+    
+    chmod +x "$SCRIPT_DIR/log-watcher"
+    exec "$SCRIPT_DIR/log-watcher"
+}
+
+# Main script logic
+case "${1:-}" in
+    "start")
+        shift
+        parse_args "$@"
+        start_demo
+        ;;
+    "clean")
+        cleanup_demo
+        ;;
+    "watch")
+        start_watch
+        ;;
+    "-h"|"--help"|"help")
+        show_usage
+        exit 0
+        ;;
+    "")
+        show_usage
+        log_warn "Please specify a command"
+        exit 1
+        ;;
+    *)
+        show_usage
+        log_error "Unknown command: $1"
+        exit 1
+        ;;
+esac

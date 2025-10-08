@@ -1,0 +1,81 @@
+#!/bin/bash
+# Enhanced KEDA Demo Watcher
+
+# Source logger functions
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMMON_DIR="$SCRIPT_DIR/common"
+
+# shellcheck disable=SC1091
+. "$COMMON_DIR/logger.sh"
+
+watch_demo() {
+  while true; do
+    clear
+    log_header "KEDA Demo Live Monitor"
+    
+    # Get pod information
+    PODS=$(kubectl get pods -n keda-demo -l app=message-consumer --no-headers 2>/dev/null)
+    POD_COUNT=$(printf "%s" "$PODS" | grep -cv '^[[:space:]]*$')
+    
+    # Show pod status
+    log_custom "$LOG_YELLOW" "📦" "Consumer Pods:"
+    if [ "$POD_COUNT" -eq 0 ]; then
+      log_custom "$LOG_RED" "  " "No pods running (scaled to zero)"
+    else
+      kubectl get pods -n keda-demo -l app=message-consumer -o wide 2>/dev/null | \
+        awk 'NR==1 {print "  " $0} NR>1 {printf "  "; print $0}'
+    fi
+    echo ""
+    
+    # Show queue information
+    log_custom "$LOG_YELLOW" "📊" "RabbitMQ Queue Status:"
+    QUEUE_INFO=$(kubectl exec -n keda-demo deployment/rabbitmq -- rabbitmqctl list_queues name messages 2>/dev/null | grep "demo-queue" 2>/dev/null || echo "demo-queue 0")
+    QUEUE_MESSAGES=$(echo "$QUEUE_INFO" | awk '{print $2}')
+    
+    if [ "$QUEUE_MESSAGES" -eq 0 ]; then
+      log_custom "$LOG_GREEN" "  " "Queue: demo-queue (0 messages - empty)"
+    else
+      log_custom "$LOG_YELLOW" "  " "Queue: demo-queue ($QUEUE_MESSAGES messages pending)"
+    fi
+    echo ""
+    
+    # Show KEDA scaling information
+    log_custom "$LOG_YELLOW" "⚡" "KEDA Autoscaler:"
+    HPA_INFO=$(kubectl get hpa -n keda-demo --no-headers 2>/dev/null | head -1)
+    if [ -n "$HPA_INFO" ]; then
+      CURRENT_REPLICAS=$(echo "$HPA_INFO" | awk '{print $7}')
+      TARGET_METRIC=$(echo "$HPA_INFO" | awk '{print $4}')
+      log_custom "$LOG_GREEN" "  " "Current Replicas: $CURRENT_REPLICAS"
+      log_custom "$LOG_BLUE" "  " "Target Metric: $TARGET_METRIC"
+    else
+      log_custom "$LOG_RED" "  " "No HPA found"
+    fi
+    echo ""
+    
+    # Show summary
+    log_custom "$LOG_BLUE" "📈" "Summary:"
+    log_custom "$LOG_NC" "  " "Pods: ${LOG_GREEN}$POD_COUNT${LOG_NC} | Messages: ${LOG_YELLOW}$QUEUE_MESSAGES${LOG_NC} | Time: $(date +%H:%M:%S)"
+    
+    # Show recent pod events if any
+    if [ "$POD_COUNT" -gt 0 ]; then
+      echo ""
+      log_custom "$LOG_YELLOW" "🔍" "Recent Pod Logs (last 3 lines):"
+      kubectl logs -n keda-demo -l app=message-consumer --tail=3 2>/dev/null | sed 's/^/  /' || echo "  No logs available"
+    fi
+    
+    echo ""
+    log_info "Press Ctrl+C to stop watching"
+    sleep 1
+  done
+}
+
+# Handle Ctrl+C gracefully
+trap 'echo ""; log_success "Stopped watching KEDA demo"; exit 0' INT
+
+# Check if namespace exists
+if ! kubectl get namespace keda-demo &>/dev/null; then
+  log_error "keda-demo namespace not found. Run the demo first!"
+  exit 1
+fi
+
+watch_demo

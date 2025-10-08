@@ -1,0 +1,158 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: message-consumer
+  namespace: keda-demo
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: message-consumer
+  template:
+    metadata:
+      labels:
+        app: message-consumer
+    spec:
+      containers:
+      - name: consumer
+        image: python:3.13-slim
+        command: ["/bin/bash"]
+        args:
+          - -c
+          - |
+            pip install pika --quiet
+            cat > /tmp/consumer.py <<'PYEOF'
+            #!/usr/bin/env python3
+            """
+            Message Consumer for KEDA Demo
+
+            This consumer connects to RabbitMQ and processes messages from the 'demo-queue'.
+            Processing time is configurable via the PROCESSING_TIME environment variable.
+            """
+
+            import pika
+            import time
+            import os
+            import sys
+            import signal
+            import logging
+
+            # Configure logging
+            logging.basicConfig(
+                level=logging.INFO,
+                format='%(asctime)s - %(levelname)s - %(message)s'
+            )
+            logger = logging.getLogger(__name__)
+
+            class MessageConsumer:
+                def __init__(self):
+                    self.connection = None
+                    self.channel = None
+                    self.processing_time = int(os.environ.get('PROCESSING_TIME', '2'))
+                    self.rabbitmq_host = os.environ.get('RABBITMQ_HOST', 'rabbitmq')
+                    self.queue_name = os.environ.get('QUEUE_NAME', 'demo-queue')
+                    
+                def connect(self):
+                    """Connect to RabbitMQ with retry logic"""
+                    max_retries = 30
+                    retry_delay = 2
+                    
+                    for attempt in range(max_retries):
+                        try:
+                            logger.info(f"Attempting to connect to RabbitMQ at {self.rabbitmq_host} (attempt {attempt + 1}/{max_retries})")
+                            self.connection = pika.BlockingConnection(
+                                pika.ConnectionParameters(host=self.rabbitmq_host)
+                            )
+                            self.channel = self.connection.channel()
+                            logger.info("Successfully connected to RabbitMQ")
+                            return True
+                        except Exception as e:
+                            logger.warning(f"Connection attempt {attempt + 1} failed: {e}")
+                            if attempt < max_retries - 1:
+                                logger.info(f"Retrying in {retry_delay} seconds...")
+                                time.sleep(retry_delay)
+                            else:
+                                logger.error("Failed to connect to RabbitMQ after all retries")
+                                return False
+                    
+                    return False
+                
+                def callback(self, ch, method, properties, body):
+                    """Process a single message"""
+                    message = body.decode()
+                    logger.info(f"[x] Received message: {message}")
+                    
+                    # Simulate processing time
+                    time.sleep(self.processing_time)
+                    
+                    # Acknowledge the message
+                    ch.basic_ack(delivery_tag=method.delivery_tag)
+                    logger.info(f"[✓] Finished processing: {message}")
+                
+                def start_consuming(self):
+                    """Start consuming messages"""
+                    if not self.connect():
+                        sys.exit(1)
+                    
+                    try:
+                        # Set up consumer
+                        self.channel.basic_qos(prefetch_count=1)
+                        self.channel.basic_consume(
+                            queue=self.queue_name, 
+                            on_message_callback=self.callback
+                        )
+                        
+                        logger.info(f"[*] Waiting for messages from queue '{self.queue_name}'. Processing time: {self.processing_time}s")
+                        logger.info("[*] To exit press CTRL+C")
+                        
+                        self.channel.start_consuming()
+                        
+                    except KeyboardInterrupt:
+                        logger.info("[!] Interrupted by user")
+                        self.stop_consuming()
+                    except Exception as e:
+                        logger.error(f"Error during message consumption: {e}")
+                        self.stop_consuming()
+                        sys.exit(1)
+                
+                def stop_consuming(self):
+                    """Stop consuming messages and close connections"""
+                    if self.channel:
+                        logger.info("Stopping message consumption...")
+                        self.channel.stop_consuming()
+                    
+                    if self.connection and not self.connection.is_closed:
+                        logger.info("Closing RabbitMQ connection...")
+                        self.connection.close()
+                
+                def signal_handler(self, signum, frame):
+                    """Handle shutdown signals gracefully"""
+                    logger.info(f"Received signal {signum}, shutting down gracefully...")
+                    self.stop_consuming()
+                    sys.exit(0)
+
+            def main():
+                """Main entry point"""
+                consumer = MessageConsumer()
+                
+                # Set up signal handlers for graceful shutdown
+                signal.signal(signal.SIGINT, consumer.signal_handler)
+                signal.signal(signal.SIGTERM, consumer.signal_handler)
+                
+                # Start consuming messages
+                consumer.start_consuming()
+
+            if __name__ == "__main__":
+                main()
+            PYEOF
+            python /tmp/consumer.py
+        env:
+        - name: PROCESSING_TIME
+          value: "__PROCESSING_TIME__"
+        resources:
+          limits:
+            cpu: 200m
+            memory: 256Mi
+          requests:
+            cpu: 100m
+            memory: 128Mi
