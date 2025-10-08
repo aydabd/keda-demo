@@ -303,12 +303,12 @@ deploy_manifests() {
     
     # Wait for RabbitMQ service
     log_progress "⏳ Waiting for RabbitMQ service..."
-    for i in {1..30}; do
+    for i in {1..60}; do
         if kubectl exec -n keda-demo deployment/rabbitmq -- rabbitmqctl status &>/dev/null; then
             break
         fi
         sleep 2
-        if [ "$i" -eq 30 ]; then
+        if [ "$i" -eq 60 ]; then
             echo ""
             log_error "RabbitMQ service failed to start"
             exit 1
