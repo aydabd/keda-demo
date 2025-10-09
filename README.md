@@ -63,11 +63,6 @@ This repository contains a complete KEDA (Kubernetes Event-Driven Autoscaling) d
 keda-demo/
 ├── keda-demo              # Main demo script
 ├── log-watcher            # Enhanced monitoring script
-├── consumer.py            # Python message consumer application
-├── Dockerfile             # Container image definition for consumer
-├── requirements.txt       # Python dependencies
-├── build-image.sh         # Build script for consumer Docker image
-├── .dockerignore          # Docker build ignore file
 ├── manifests/             # Kubernetes manifests
 │   ├── rabbitmq.yaml     # RabbitMQ deployment & service
 │   ├── consumer.yaml     # Message consumer deployment
@@ -86,21 +81,7 @@ The consumer application (`consumer.py`) is a standalone Python application that
 - Processes messages from the `demo-queue` with configurable processing time
 - Supports graceful shutdown on SIGINT/SIGTERM signals
 - Includes comprehensive logging and health checks
-- Is packaged as a Docker container for consistent deployment
-
-### Building the Consumer Image
-
-The demo script automatically builds the consumer Docker image, but you can also build it manually:
-
-```bash
-# Build using the provided script
-./build-image.sh
-
-# Or build directly with Docker
-docker build -t keda-demo-consumer:latest .
-```
-
-The image is tagged as `keda-demo-consumer:latest` and configured with `imagePullPolicy: Never` to use the local image.
+- Is embedded as a Docker container for consistent deployment
 
 ## GitHub Actions Workflow
 
